@@ -1014,92 +1014,259 @@ function buildDistLabel(t, curve, pts){
 }
 
 /* Ancorarea etichetei PE arc: ținta este mijlocul curbei (t = 0.5); dacă acel punct
-   se proiectează în afara zonei sigure a ecranului (arcurile lungi spre teritoriile
-   îndepărtate urcă peste marginea de sus după zborul cinematic), eticheta alunecă
-   de-a lungul curbei până la punctul VIZIBIL cel mai apropiat de mijloc — rămâne
-   mereu pe linia aurie, deasupra ei (+7% rază, de-a lungul normalei), fără să
-   acopere panoul din dreapta, felia docată stânga-jos sau markerul țintă. */
-var _lv = new THREE.Vector3(), _gp = new THREE.Vector3();
+   se proiectează în afara zonei sigure a ecranului, eticheta alunecă de-a lungul
+   curbei până la punctul VIZIBIL cel mai apropiat de mijloc — rămâne mereu pe
+   linia aurie, deasupra ei (+4% rază). Zona sigură este clamp-ată DUR în interiorul
+   viewport-ului (≥70 px de fiecare margine sau semi-dimensiunea pastilei + 12 px,
+   oricare e mai mare), evitând panoul din dreapta (~430 px) și felia docată
+   stânga-jos → pastila este ÎNTOTDEAUNA integral vizibilă, netăiată.
+   Dacă niciun punct al arcului nu are o proiecție validă (arc ocultat de planetă),
+   ancora cade pe proiecția mijlocului curbei, clamp-ată în zona sigură și
+   reproiectată în scenă la aceeași distanță de cameră (mod overlay/holografic). */
+var _lv = new THREE.Vector3(), _gp = new THREE.Vector3(), _wv = new THREE.Vector3(), _cdir = new THREE.Vector3();
+function clampN(v, a, b){ return Math.max(a, Math.min(b, v)); }
 function anchorArcLabel(L){
   var W = window.innerWidth, H = window.innerHeight, mob = W <= 820;
-  var xMin = (mob ? 0.08 : 0.06) * W, xMax = (mob ? 0.92 : 0.66) * W;   // desktop: evită panoul din dreapta
-  var yMin = 0.12 * H, yMax = (mob ? 0.26 : 0.80) * H;                  // sub bara de filtre; mobil: deasupra bottom-sheet-ului panoului
-  var chipX = 0.45 * W, chipY = 0.54 * H;                               // desktop: zona feliei docate stânga-jos
+  var tanF = Math.tan(camera.fov * Math.PI / 360);
+  var halfW = H * L.baseH * L.aspect / (4 * tanF);   // semi-lățimea pastilei, în px
+  var halfH = H * L.baseH / (4 * tanF);              // semi-înălțimea pastilei, în px
+  /* zona sigură: pastila INTEGRALĂ în viewport, cu padding ≥ 70 px */
+  var xMin = Math.max(70, halfW + 12);
+  var xMax = Math.min(W - 70, W - halfW - 12);
+  if (!mob) xMax = Math.min(xMax, W - 446 - halfW);  // desktop: panoul din dreapta (430 px + margine)
+  /* sus: ≥70 px de margine ȘI sub bara de filtre (top:18px + ~46px; pe mobil poate
+     încăpea pe două rânduri) — pastila nu se suprapune niciodată cu UI-ul */
+  var yMin = Math.max(70, halfH + 12, halfH + (mob ? 116 : 78));
+  var yMax = Math.min(H - 70, H - halfH - 12);
+  if (mob) yMax = Math.min(yMax, 0.30 * H);          // mobil: deasupra bottom-sheet-ului panoului
+  if (xMax < xMin){ xMax = xMin = W / 2; }           // ecrane foarte înguste: centru, orice s-ar întâmpla
+  if (yMax < yMin){ yMax = yMin = H / 2; }
+  var chipX = 0.45 * W, chipY = 0.54 * H;            // desktop: zona feliei docate stânga-jos
   arcGroup.updateWorldMatrix(true, false);
-  var halfW = H * L.baseH * L.aspect / (4 * Math.tan(camera.fov * Math.PI / 360));   // semi-lățimea pastilei, în px
-  _gp.setFromMatrixPosition(arcGroup.matrixWorld);                      // centrul globului (world)
-  /* două treceri: întâi cu excluderea zonelor UI (felia docată + steag); pe mobil,
-     dacă tot segmentul vizibil al arcului cade sub felie (ecran îngust), a doua trecere
-     relaxează excluderea — iar dacă nici așa nu există un punct liber, eticheta se
-     desenează PESTE felie (overlay), ca ultimă soluție pentru a rămâne lizibilă. */
-  var acc = [], passUsed = -1;
-  for (var pass = 0; pass < 2 && passUsed < 0; pass++){
-    acc.length = 0;
-    for (var i = 8; i <= 112; i++){                                     // evită capetele (markerul țintă / punctul Paris)
-      _lv.copy(L.pts[i]).applyMatrix4(arcGroup.matrixWorld);
-      var wx = _lv.x - _gp.x, wy = _lv.y - _gp.y, wz = _lv.z - _gp.z;   // punctul trebuie să fie pe emisfera
-      if (wx*(camera.position.x-_lv.x) + wy*(camera.position.y-_lv.y) + wz*(camera.position.z-_lv.z) <= 0) continue;   // vizibilă spre cameră
+  _gp.setFromMatrixPosition(arcGroup.matrixWorld);   // centrul globului (world)
+  camera.getWorldDirection(_cdir);
+  var pick = -1, pickChip = false;
+  /* două trepte: (0) puncte cu fața spre cameră; (1) doar în modul holo — și punctele
+     de pe emisfera opusă, pentru că linia arcului e oricum desenată peste glob.
+     În fiecare treaptă se preferă punctul cel mai apropiat de mijlocul curbei;
+     punctele din zona feliei docate sunt folosite doar dacă nu există altceva
+     (atunci pastila se desenează PESTE felie — overlay). */
+  for (var s = 0; s < 2 && pick < 0; s++){
+    if (s === 1 && !L.holo) break;
+    var needFace = (s === 0);
+    var bFree = -1, bFreeD = 1e9, bChip = -1, bChipD = 1e9;
+    for (var i = 6; i <= 114; i++){                  // evită capetele (markerul țintă / punctul Paris)
+      if (needFace){
+        _lv.copy(L.pts[i]).applyMatrix4(arcGroup.matrixWorld);
+        var wx = _lv.x - _gp.x, wy = _lv.y - _gp.y, wz = _lv.z - _gp.z;
+        if (wx*(camera.position.x-_lv.x) + wy*(camera.position.y-_lv.y) + wz*(camera.position.z-_lv.z) <= 0) continue;   // vizibilă spre cameră
+      }
       _lv.copy(L.pts[i]).normalize().multiplyScalar(L.pts[i].length() * 1.04).applyMatrix4(arcGroup.matrixWorld);   // poziția ridicată a pastilei
+      var dx = _lv.x - camera.position.x, dy = _lv.y - camera.position.y, dz = _lv.z - camera.position.z;
+      if (dx*_cdir.x + dy*_cdir.y + dz*_cdir.z <= 0) continue;   // în spatele camerei → proiecție invalidă
       _lv.project(camera);
       if (_lv.z > 1) continue;
       var px = (_lv.x * 0.5 + 0.5) * W, py = (-_lv.y * 0.5 + 0.5) * H;
-      if (px < Math.max(xMin, halfW + 4) || px > Math.min(xMax, W - halfW - 4) || py < yMin || py > yMax) continue;   // pastila să nu fie tăiată
-      if (pass === 0 && !mob && px < chipX && py > chipY) continue;     // nu acoperă felia docată
-      if (pass === 0 && mob && px < 0.68 * W && py < 0.29 * H) continue;   // mobil: felia + steagul docate sus-stânga
-      acc.push({ i: i, px: px, py: py });
+      if (px < xMin || px > xMax || py < yMin || py > yMax) continue;   // pastila să nu fie tăiată
+      var underChip = mob ? (px < 0.68 * W && py < 0.29 * H) : (px < chipX && py > chipY);
+      var d = Math.abs(i / 120 - 0.5);
+      if (underChip){ if (d < bChipD){ bChipD = d; bChip = i; } }
+      else if (d < bFreeD){ bFreeD = d; bFree = i; }
     }
-    if (acc.length) passUsed = pass;
+    if (bFree >= 0){ pick = bFree; }
+    else if (bChip >= 0){ pick = bChip; pickChip = true; }
   }
-  var best = -1;
   L.overlay = false;
-  if (passUsed === 0){
-    if (acc[0].i <= 60 && 60 <= acc[acc.length - 1].i) best = 60;       // mijlocul curbei e vizibil → exact acolo
-    else best = acc[acc.length >> 1].i;                                 // mijlocul porțiunii vizibile a arcului
-  } else if (passUsed === 1){
-    var bestD = 2, bestAny = -1, bestAnyD = 2;
-    for (var j = 0; j < acc.length; j++){                               // punctul vizibil cel mai apropiat de mijlocul curbei
-      var d = Math.abs(acc[j].i / 120 - 0.5);
-      var underChip = mob && acc[j].px < 0.68 * W && acc[j].py < 0.29 * H;
-      if (d < bestAnyD){ bestAnyD = d; bestAny = acc[j].i; }
-      if (!underChip && d < bestD){ bestD = d; best = acc[j].i; }
+  if (pick >= 0){
+    /* overlay dacă pastila cade peste felia docată sau (mod holo) e ancorată pe
+       porțiunea de arc din spatele globului — în ambele cazuri se desenează deasupra */
+    if (pickChip) L.overlay = true;
+    else if (L.holo){
+      _lv.copy(L.pts[pick]).applyMatrix4(arcGroup.matrixWorld);
+      var nx = _lv.x - _gp.x, ny = _lv.y - _gp.y, nz = _lv.z - _gp.z;
+      if (nx*(camera.position.x-_lv.x) + ny*(camera.position.y-_lv.y) + nz*(camera.position.z-_lv.z) <= 0) L.overlay = true;
     }
-    if (best < 0){ best = bestAny; L.overlay = true; }                  // ultima soluție: pastila se desenează peste felie
+    var p = L.pts[pick];
+    L.sprite.position.copy(_lv.copy(p).normalize().multiplyScalar(p.length() * 1.04));   // ușor deasupra liniei
+  } else {
+    /* FALLBACK ABSOLUT: niciun punct valid pe arc → proiecția mijlocului curbei,
+       clamp-ată DUR în zona sigură, reproiectată în scenă la distanța mijlocului
+       de cameră. Pastila rămâne mereu în ecran, integral vizibilă (overlay). */
+    L.overlay = true;
+    var pm = L.pts[60];
+    _wv.copy(pm).normalize().multiplyScalar(pm.length() * 1.04).applyMatrix4(arcGroup.matrixWorld);
+    var camDist = camera.position.distanceTo(_wv);
+    _lv.copy(_wv).project(camera);
+    var cx = clampN((_lv.x * 0.5 + 0.5) * W, xMin, xMax);
+    var cy = clampN((-_lv.y * 0.5 + 0.5) * H, yMin, yMax);
+    _lv.set(cx / W * 2 - 1, -(cy / H * 2 - 1), 0.5).unproject(camera);
+    _lv.sub(camera.position).normalize().multiplyScalar(camDist).add(camera.position);
+    arcGroup.worldToLocal(_lv);
+    L.sprite.position.copy(_lv);
   }
-  if (best < 0){ best = 60; L.overlay = mob; }                          // fallback: mijlocul curbei
-  L.anchor = { i: best, pass: passUsed, overlay: L.overlay };
-  var p = L.pts[best];
-  L.sprite.position.copy(_lv.copy(p).normalize().multiplyScalar(p.length() * 1.04));   // ușor deasupra liniei
+  L.anchor = { i: pick, overlay: L.overlay };
+}
+
+/* Rotația finală (post-zbor) a lanțului globe→tiltG→spinG, ca matrice de rotație
+   local arcGroup → world. Replică EXACT formulele deterministe din flyTo (ținta
+   zborului), fără să atingă zborul însuși — folosită doar pentru a orienta
+   apexul arcelor quasi-antipodale spre camera finală. Valabilă și la
+   prefers-reduced-motion (acolo tween-urile sar instant la starea finală). */
+function arcFinalRotation(){
+  var m = markers[selected];
+  var q = m.pos.clone().applyAxisAngle(Y_AXIS, spinG.rotation.y).applyAxisAngle(Z_AXIS, tiltG.rotation.z);
+  var r = q.length();
+  var az = Math.atan2(q.x, q.z);
+  var el = Math.asin(Math.max(-1, Math.min(1, q.y / r)));
+  var gx1 = isMobile ? 0 : -0.52, gy1 = isMobile ? 0.48 : 0.02;
+  var dx = 0 - gx1, dy = 0.12 - gy1, dz = 2.28;
+  var dl = Math.sqrt(dx*dx + dy*dy + dz*dz);
+  var Az = Math.atan2(dx / dl, dz / dl);
+  var El = Math.asin(dy / dl) + 0.05;
+  var targetY = globe.rotation.y + shortestAngle(globe.rotation.y, Az - az);
+  var targetX = el - El;
+  var mg = new THREE.Matrix4().makeRotationFromEuler(new THREE.Euler(targetX, targetY, 0, globe.rotation.order));
+  var mt = new THREE.Matrix4().makeRotationFromEuler(tiltG.rotation.clone());
+  var ms = new THREE.Matrix4().makeRotationFromEuler(spinG.rotation.clone());
+  return mg.multiply(mt).multiply(ms);
+}
+
+/* Împinge radial la suprafață (≥1.025R) orice punct al arcului care ar intra în
+   interiorul planetei — o curbă Bezier îndoită spre cameră (arcuri quasi-
+   antipodale) „tunelizează” prin glob lângă capătul Paris (emisfera opusă);
+   direcțiile punctelor baluează continuu spre partea dinspre cameră, deci linia
+   rezultată rămâne lină, în cadru, desenată peste glob (modul holo). */
+function clampArcPts(pts, mid){
+  for (var i = 0; i < pts.length; i++){
+    var rl = pts[i].length();
+    if (rl < 1.025){
+      if (rl < 1e-4) pts[i].copy(mid).normalize().multiplyScalar(1.025);
+      else pts[i].multiplyScalar(1.025 / rl);
+    }
+  }
+  return pts;
 }
 
 function buildArc(t){
   clearArc();
   var p1 = llToVec3(PARIS[0], PARIS[1], 1.02);
   var p2 = llToVec3(t.coords[0], t.coords[1], 1.02);
-  var dist = p1.distanceTo(p2);
-  var mid = p1.clone().add(p2).multiplyScalar(0.5).normalize().multiplyScalar(1.02 + 0.18 + dist*0.22);
-  var curve = new THREE.QuadraticBezierCurve3(p1, mid, p2);
-  var pts = curve.getPoints(120);
+  var sigma = p1.angleTo(p2);            // distanța unghiulară Paris → țintă (rad)
+  /* ALTITUDINEA punctului de control crește cu distanța unghiulară.
+     La o curbă Bezier pătratică punctul de la t=0.5 este 0.25·(p1+p2) + 0.5·mid,
+     deci pentru un apex real A (rază) avem nevoie de midR = 2·A − 1.02·cos(σ/2).
+     Pentru arcuri scurte/medii formula de mai jos coincide EXACT cu vechiul
+     midR = 1.2 + 0.22·coardă (comportament dovedit vizual, neschimbat). */
+  var baseApex = 0.6 + 0.2244 * Math.sin(sigma / 2) + 0.51 * Math.cos(sigma / 2);   // = vechiul apex (rază)
+  var boost = Math.max(0, (sigma - 1.9) / (Math.PI - 1.9));   // 0 sub ~109°, 1 la antipode
+  boost = boost * boost * (3 - 2 * boost);                    // smoothstep → tranziție lină
+  var apex = baseApex * (1 - boost) + 1.10 * boost;
+  var midR = 2 * apex - 1.02 * Math.cos(sigma / 2);
+  /* direcția mijlocului: bisectoarea p1/p2 (stabilă numeric și aproape de antipode,
+     unde normalize(p1+p2) devine explozivă) */
+  var midDir = p1.clone().add(p2);
+  if (midDir.length() > 1e-4) midDir.normalize();
+  else midDir = (Math.abs(p1.y) > 0.9 ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 1, 0)).cross(p1).normalize();
+  /* Mod „holografic”: pentru ținte al căror capăt Paris cade (aproape) în spatele
+     limbului globului din camera post-zbor (σ > ~93°), linia + capul + punctul
+     Paris se randează peste glob (depthTest:false, fără depthWrite), cu estetica
+     aurie + glow păstrată, iar arcul este orientat SPRE CAMERĂ pentru a rămâne
+     integral în cadru. Două regimuri (în rest → randare neschimbată):
+       · σ ∈ (93°, 100°) — doar Clipperton dintre cele 13: Paris e puțin în spatele
+         limbului și apexul natural iese ~20 px deasupra cadrului → îndoire FINĂ
+         (ținta ~28° de axa vizuală), înălțimea naturală a apexului păstrată;
+       · σ > ~117° — Noua Caledonie / Wallis / Polinezia (quasi-antipodale): un
+         apex pur radial cade lângă limbul globului și iese complet din cadru →
+         îndoire PUTERNICĂ spre privitor (ținta ~14°), apex ≈1.25R plutind în
+         fața globului. TAAF (σ≈114°) rămâne deliberate în afara ambelor regimuri:
+         arcul său natural se afișa deja corect. */
+  var holo = sigma > 2.05 || (sigma > 1.62 && sigma < 1.75);
+  var deep = sigma > 2.05;   // quasi-antipodal: îndoire puternică spre privitor
+  var mid, curve, pts;
+  if (holo){
+    /* Îndoirea folosește rotația finală a globului (aceeași formulă deterministă
+       ca în flyTo — zborul rămâne neatins). La z≈2.28 globul umple cadrul, deci
+       doar direcțiile la ≲20° de axa vizuală (vertical) se proiectează integral
+       în ecran. Mai mult: porțiunea de arc „clamp-ată” la suprafață traversează
+       limbul globului — vizibilă doar dacă trece pe o porțiune de limB AFĂRATĂ
+       în cadru (lateral, nu sus/jos, unde globul e tăiat de ecran). De aceea,
+       pentru arcurile deep se încearcă și ROTAȚII ale punctului de control în
+       jurul axei vizuale (azimutul apexului) și se alege — punct cu punct, în
+       matricele camerei FINALE — primul candidat a cărui proiecție COMPLETĂ
+       încape în ecran (altfel câștigă candidatul cu încălcarea minimă). Astfel
+       arcul nu iese din cadru pentru NICIUN teritoriu, indiferent de geometrie. */
+    var fin = arcFinalRotation();                            // rotație local arcGroup → world (post-zbor)
+    var finT = fin.clone().transpose();                      // inversa (rotație pură)
+    var gx1 = isMobile ? 0 : -0.52, gy1 = isMobile ? 0.48 : 0.02;
+    var camDirW = new THREE.Vector3(0 - gx1, 0.12 - gy1, 2.28).normalize();   // spre cameră (world, post-zbor)
+    var camDirL = camDirW.clone().applyMatrix4(finT).normalize();             // spre cameră, în local
+    var beta = midDir.clone().applyMatrix4(fin).angleTo(camDirW);             // unghi bisectoare ↔ axa vizuală
+    var thetaT = (deep ? 14 : 28) * Math.PI / 180;                            // ținta: unghiul apexului față de axa vizuală
+    var bend = Math.sin(beta) / Math.tan(thetaT) - Math.cos(beta);
+    if (beta > 175 * Math.PI / 180) bend = 4;              // bisectoare opusă camerei: direct spre privitor
+    bend = Math.max(0.55, Math.min(12, bend));                               // limite: mereu o ridicare vizibilă
+    var md0 = midDir.clone().add(camDirL.clone().multiplyScalar(bend)).normalize()
+                    .multiplyScalar((deep ? 2 * 1.25 : 2 * baseApex) - 1.02 * Math.cos(sigma / 2));   // deep: apex ≈1.25R; fin: înălțime naturală
+    var phiList = deep ? [0, 20, -20, 40, -40, 60, -60, 80, -80, 110, -110] : [0];                // rotații (°) ale apexului în jurul axei vizuale
+    var eyeV = new THREE.Vector3(0, 0.12, 2.28), tgtV = new THREE.Vector3(gx1, gy1, 0);
+    var viewM = new THREE.Matrix4().lookAt(eyeV, tgtV, new THREE.Vector3(0, 1, 0)).setPosition(eyeV).invert();
+    var worldM = new THREE.Matrix4().makeTranslation(gx1, gy1, 0).multiply(fin);
+    var v4 = new THREE.Vector3();
+    var W0 = window.innerWidth, H0 = window.innerHeight, PADS = 24;
+    var bestScore = 1e9;
+    for (var ti = 0; ti < phiList.length; ti++){
+      var md = ti === 0 ? md0 : md0.clone().applyAxisAngle(camDirL, phiList[ti] * Math.PI / 180);
+      var cc = new THREE.QuadraticBezierCurve3(p1, md, p2);
+      var pp = clampArcPts(cc.getPoints(120), md);
+      if (!deep){ mid = md; curve = cc; pts = pp; break; }
+      var score = 0;
+      for (var pi2 = 0; pi2 < pp.length; pi2 += 2){
+        v4.copy(pp[pi2]).applyMatrix4(worldM).applyMatrix4(viewM).applyMatrix4(camera.projectionMatrix);
+        var sx = (v4.x * 0.5 + 0.5) * W0, sy = (-v4.y * 0.5 + 0.5) * H0;
+        var viol = Math.max(0, PADS - sx, sx - (W0 - PADS), PADS - sy, sy - (H0 - PADS));
+        if (viol > score) score = viol;
+      }
+      if (score <= 0){ mid = md; curve = cc; pts = pp; break; }              // proiecție complet în cadru
+      if (score < bestScore){ bestScore = score; mid = md; curve = cc; pts = pp; }   // altfel: încălcarea minimă
+    }
+  } else {
+    mid = midDir.multiplyScalar(midR);
+    curve = new THREE.QuadraticBezierCurve3(p1, mid, p2);
+    pts = curve.getPoints(120);
+  }
+  /* SIGURANȚĂ: niciun punct al arcului nu poate intra în interiorul planetei —
+     punctele sub 1.025R sunt împinse radial la suprafață (arcele scurte,
+     ≥1.02R natural, nu sunt afectate deloc). */
+  clampArcPts(pts, mid);
   var geo = new THREE.BufferGeometry().setFromPoints(pts);
   var mat = new THREE.LineBasicMaterial({ color: 0xd4b483, transparent: true, opacity: 0.9 });
+  if (holo){ mat.depthTest = false; mat.depthWrite = false; }
   var line = new THREE.Line(geo, mat);
+  if (holo) line.renderOrder = 40;
   arcGroup.add(line);
 
   var headMat = new THREE.SpriteMaterial({ map: glowTexture('#d4b483'), transparent: true, blending: THREE.AdditiveBlending, depthWrite: false });
+  if (holo) headMat.depthTest = false;
   var head = new THREE.Sprite(headMat);
   head.scale.set(0.07, 0.07, 1);
+  if (holo) head.renderOrder = 41;
   arcGroup.add(head);
 
-  var parisDot = new THREE.Mesh(new THREE.SphereGeometry(0.009, 12, 12), new THREE.MeshBasicMaterial({ color: 0xd4b483, transparent: true }));
+  var parisDotMat = new THREE.MeshBasicMaterial({ color: 0xd4b483, transparent: true });
+  if (holo){ parisDotMat.depthTest = false; parisDotMat.depthWrite = false; }
+  var parisDot = new THREE.Mesh(new THREE.SphereGeometry(0.009, 12, 12), parisDotMat);
   parisDot.position.copy(p1);
+  if (holo) parisDot.renderOrder = 40;
   arcGroup.add(parisDot);
 
   var distLabel = buildDistLabel(t, curve, pts);
+  distLabel.holo = holo;   // eticheta poate fi ancorată și pe porțiunea „prin glob” a arcului
   arcGroup.add(distLabel.sprite);   // același grup cu arcul → se rotește cu globul, moare cu dispose-ul arcului
 
-  arcState = { curve: curve, line: line, head: head, dot: parisDot, k: 0,
+  arcState = { curve: curve, pts: pts, line: line, head: head, dot: parisDot, k: 0, holo: holo,
                label: distLabel,
                items: [line, head, parisDot, distLabel.sprite],
-               mats: [mat, headMat, parisDot.material, distLabel.mat], geo: geo };
+               mats: [mat, headMat, parisDotMat, distLabel.mat], geo: geo };
   if (REDUCED) setArcK(1);
 }
 function setArcK(k){
@@ -1107,7 +1274,7 @@ function setArcK(k){
   arcState.k = k;
   var n = Math.max(2, Math.floor(121 * k));
   arcState.geo.setDrawRange(0, n);
-  arcState.head.position.copy(arcState.curve.getPoint(Math.min(1, k)));
+  arcState.head.position.copy(arcState.pts[Math.max(0, Math.min(120, Math.round(k * 120)))]);   // urmărește exact linia (punctele clamp-ate)
   arcState.head.visible = k < 0.995;
   if (arcState.label && k >= 0.9 && !arcState.label.on){   // eticheta apare doar spre finalul desenării arcului
     arcState.label.on = true;
@@ -1764,7 +1931,7 @@ window.__atlas.chip = function(){
 };
 window.__atlas.arc = function(){
   if (!arcState) return null;
-  var out = { k: +arcState.k.toFixed(3), sprites: 0, label: null };
+  var out = { k: +arcState.k.toFixed(3), sprites: 0, label: null, holo: !!arcState.holo };
   arcGroup.children.forEach(function(o){ if (o.isSprite) out.sprites++; });
   if (arcState.label){
     var L = arcState.label;
