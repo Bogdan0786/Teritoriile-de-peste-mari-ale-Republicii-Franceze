@@ -1110,7 +1110,7 @@ function anchorArcLabel(L){
 /* Rotația finală (post-zbor) a lanțului globe→tiltG→spinG, ca matrice de rotație
    local arcGroup → world. Replică EXACT formulele deterministe din flyTo (ținta
    zborului), fără să atingă zborul însuși — folosită doar pentru a orienta
-   apexul arcelor quasi-antipodale spre camera finală. Valabilă și la
+   apexul arcului Clipperton (îndoirea fină) spre camera finală. Valabilă și la
    prefers-reduced-motion (acolo tween-urile sar instant la starea finală). */
 function arcFinalRotation(){
   var m = markers[selected];
@@ -1147,88 +1147,66 @@ function clampArcPts(pts, mid){
   return pts;
 }
 
+/* Pragul „cadrului perfect de-a lungul rutei”: peste ~120° distanță unghiulară
+   Paris→țintă (Polinezia ≈141°, Wallis ≈144°, N. Caledonie ≈150°), zborul se
+   termină cu globul orientat DE-A LUNGUL CERCULUI MARE (vezi routeFrame), deci
+   arcul standard rămâne integral vizibil. TAAF (≈114°) rămâne DELIBERAT sub prag
+   (afișare deja corectă, neschimbată); Clipperton (≈96°) păstrează îndoirea fină. */
+var ROUTE_SIGMA = 2.0944;   // 120° în radiani
+
 function buildArc(t){
   clearArc();
   var p1 = llToVec3(PARIS[0], PARIS[1], 1.02);
   var p2 = llToVec3(t.coords[0], t.coords[1], 1.02);
   var sigma = p1.angleTo(p2);            // distanța unghiulară Paris → țintă (rad)
+  var route = sigma > ROUTE_SIGMA;       // quasi-antipodal: orientarea finală e „de-a lungul rutei”
   /* ALTITUDINEA punctului de control crește cu distanța unghiulară.
      La o curbă Bezier pătratică punctul de la t=0.5 este 0.25·(p1+p2) + 0.5·mid,
      deci pentru un apex real A (rază) avem nevoie de midR = 2·A − 1.02·cos(σ/2).
      Pentru arcuri scurte/medii formula de mai jos coincide EXACT cu vechiul
-     midR = 1.2 + 0.22·coardă (comportament dovedit vizual, neschimbat). */
+     midR = 1.2 + 0.22·coardă (comportament dovedit vizual, neschimbat).
+     Pentru rutele quasi-antipodale (cadru orientat de-a lungul rutei) apexul este
+     moderat și proporțional cu unghiul: ≈1.34R — aceeași curbă Bezier aurie ca la
+     teritoriile apropiate, doar puțin mai înaltă. */
   var baseApex = 0.6 + 0.2244 * Math.sin(sigma / 2) + 0.51 * Math.cos(sigma / 2);   // = vechiul apex (rază)
   var boost = Math.max(0, (sigma - 1.9) / (Math.PI - 1.9));   // 0 sub ~109°, 1 la antipode
   boost = boost * boost * (3 - 2 * boost);                    // smoothstep → tranziție lină
-  var apex = baseApex * (1 - boost) + 1.10 * boost;
+  var apex = route ? (1.22 + 0.13 * Math.sin(sigma / 2))
+                   : baseApex * (1 - boost) + 1.10 * boost;
   var midR = 2 * apex - 1.02 * Math.cos(sigma / 2);
   /* direcția mijlocului: bisectoarea p1/p2 (stabilă numeric și aproape de antipode,
      unde normalize(p1+p2) devine explozivă) */
   var midDir = p1.clone().add(p2);
   if (midDir.length() > 1e-4) midDir.normalize();
   else midDir = (Math.abs(p1.y) > 0.9 ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 1, 0)).cross(p1).normalize();
-  /* Mod „holografic”: pentru ținte al căror capăt Paris cade (aproape) în spatele
-     limbului globului din camera post-zbor (σ > ~93°), linia + capul + punctul
-     Paris se randează peste glob (depthTest:false, fără depthWrite), cu estetica
-     aurie + glow păstrată, iar arcul este orientat SPRE CAMERĂ pentru a rămâne
-     integral în cadru. Două regimuri (în rest → randare neschimbată):
-       · σ ∈ (93°, 100°) — doar Clipperton dintre cele 13: Paris e puțin în spatele
-         limbului și apexul natural iese ~20 px deasupra cadrului → îndoire FINĂ
-         (ținta ~28° de axa vizuală), înălțimea naturală a apexului păstrată;
-       · σ > ~117° — Noua Caledonie / Wallis / Polinezia (quasi-antipodale): un
-         apex pur radial cade lângă limbul globului și iese complet din cadru →
-         îndoire PUTERNICĂ spre privitor (ținta ~14°), apex ≈1.25R plutind în
-         fața globului. TAAF (σ≈114°) rămâne deliberate în afara ambelor regimuri:
-         arcul său natural se afișa deja corect. */
-  var holo = sigma > 2.05 || (sigma > 1.62 && sigma < 1.75);
-  var deep = sigma > 2.05;   // quasi-antipodal: îndoire puternică spre privitor
+  /* Mod „holografic” — DOAR pentru Clipperton (σ ≈ 96°, unicul teritoriu din
+     intervalul 93°–100°): Paris cade puțin în spatele limbului din camera post-zbor
+     și apexul natural iese ~20 px deasupra cadrului → îndoire FINĂ a punctului de
+     control spre cameră (ținta ~28° de axa vizuală, înălțimea naturală păstrată) +
+     randare peste glob (depthTest:false). TAAF (σ≈114°) rămâne în afara regimului.
+     Pentru σ > 120° NU mai există niciun hack: routeFrame() aduce ambele capete pe
+     discul globului (camera privește de-a lungul rutei), deci întregul arc standard
+     este în emisfera vizibilă — linie aurie cu randare normală, exact ca la
+     teritoriile apropiate. */
+  var holo = sigma > 1.62 && sigma < 1.75;
   var mid, curve, pts;
   if (holo){
     /* Îndoirea folosește rotația finală a globului (aceeași formulă deterministă
-       ca în flyTo — zborul rămâne neatins). La z≈2.28 globul umple cadrul, deci
-       doar direcțiile la ≲20° de axa vizuală (vertical) se proiectează integral
-       în ecran. Mai mult: porțiunea de arc „clamp-ată” la suprafață traversează
-       limbul globului — vizibilă doar dacă trece pe o porțiune de limB AFĂRATĂ
-       în cadru (lateral, nu sus/jos, unde globul e tăiat de ecran). De aceea,
-       pentru arcurile deep se încearcă și ROTAȚII ale punctului de control în
-       jurul axei vizuale (azimutul apexului) și se alege — punct cu punct, în
-       matricele camerei FINALE — primul candidat a cărui proiecție COMPLETĂ
-       încape în ecran (altfel câștigă candidatul cu încălcarea minimă). Astfel
-       arcul nu iese din cadru pentru NICIUN teritoriu, indiferent de geometrie. */
+       ca în flyTo — zborul rămâne neatins). */
     var fin = arcFinalRotation();                            // rotație local arcGroup → world (post-zbor)
     var finT = fin.clone().transpose();                      // inversa (rotație pură)
     var gx1 = isMobile ? 0 : -0.52, gy1 = isMobile ? 0.48 : 0.02;
     var camDirW = new THREE.Vector3(0 - gx1, 0.12 - gy1, 2.28).normalize();   // spre cameră (world, post-zbor)
     var camDirL = camDirW.clone().applyMatrix4(finT).normalize();             // spre cameră, în local
     var beta = midDir.clone().applyMatrix4(fin).angleTo(camDirW);             // unghi bisectoare ↔ axa vizuală
-    var thetaT = (deep ? 14 : 28) * Math.PI / 180;                            // ținta: unghiul apexului față de axa vizuală
+    var thetaT = 28 * Math.PI / 180;                                          // ținta: unghiul apexului față de axa vizuală
     var bend = Math.sin(beta) / Math.tan(thetaT) - Math.cos(beta);
     if (beta > 175 * Math.PI / 180) bend = 4;              // bisectoare opusă camerei: direct spre privitor
     bend = Math.max(0.55, Math.min(12, bend));                               // limite: mereu o ridicare vizibilă
-    var md0 = midDir.clone().add(camDirL.clone().multiplyScalar(bend)).normalize()
-                    .multiplyScalar((deep ? 2 * 1.25 : 2 * baseApex) - 1.02 * Math.cos(sigma / 2));   // deep: apex ≈1.25R; fin: înălțime naturală
-    var phiList = deep ? [0, 20, -20, 40, -40, 60, -60, 80, -80, 110, -110] : [0];                // rotații (°) ale apexului în jurul axei vizuale
-    var eyeV = new THREE.Vector3(0, 0.12, 2.28), tgtV = new THREE.Vector3(gx1, gy1, 0);
-    var viewM = new THREE.Matrix4().lookAt(eyeV, tgtV, new THREE.Vector3(0, 1, 0)).setPosition(eyeV).invert();
-    var worldM = new THREE.Matrix4().makeTranslation(gx1, gy1, 0).multiply(fin);
-    var v4 = new THREE.Vector3();
-    var W0 = window.innerWidth, H0 = window.innerHeight, PADS = 24;
-    var bestScore = 1e9;
-    for (var ti = 0; ti < phiList.length; ti++){
-      var md = ti === 0 ? md0 : md0.clone().applyAxisAngle(camDirL, phiList[ti] * Math.PI / 180);
-      var cc = new THREE.QuadraticBezierCurve3(p1, md, p2);
-      var pp = clampArcPts(cc.getPoints(120), md);
-      if (!deep){ mid = md; curve = cc; pts = pp; break; }
-      var score = 0;
-      for (var pi2 = 0; pi2 < pp.length; pi2 += 2){
-        v4.copy(pp[pi2]).applyMatrix4(worldM).applyMatrix4(viewM).applyMatrix4(camera.projectionMatrix);
-        var sx = (v4.x * 0.5 + 0.5) * W0, sy = (-v4.y * 0.5 + 0.5) * H0;
-        var viol = Math.max(0, PADS - sx, sx - (W0 - PADS), PADS - sy, sy - (H0 - PADS));
-        if (viol > score) score = viol;
-      }
-      if (score <= 0){ mid = md; curve = cc; pts = pp; break; }              // proiecție complet în cadru
-      if (score < bestScore){ bestScore = score; mid = md; curve = cc; pts = pp; }   // altfel: încălcarea minimă
-    }
+    mid = midDir.clone().add(camDirL.multiplyScalar(bend)).normalize()
+                .multiplyScalar(2 * baseApex - 1.02 * Math.cos(sigma / 2));   // înălțimea naturală a apexului
+    curve = new THREE.QuadraticBezierCurve3(p1, mid, p2);
+    pts = clampArcPts(curve.getPoints(120), mid);
   } else {
     mid = midDir.multiplyScalar(midR);
     curve = new THREE.QuadraticBezierCurve3(p1, mid, p2);
@@ -1263,7 +1241,7 @@ function buildArc(t){
   distLabel.holo = holo;   // eticheta poate fi ancorată și pe porțiunea „prin glob” a arcului
   arcGroup.add(distLabel.sprite);   // același grup cu arcul → se rotește cu globul, moare cu dispose-ul arcului
 
-  arcState = { curve: curve, pts: pts, line: line, head: head, dot: parisDot, k: 0, holo: holo,
+  arcState = { curve: curve, pts: pts, line: line, head: head, dot: parisDot, k: 0, holo: holo, route: route,
                label: distLabel,
                items: [line, head, parisDot, distLabel.sprite],
                mats: [mat, headMat, parisDotMat, distLabel.mat], geo: geo };
@@ -1806,30 +1784,91 @@ function selectTeritoriu(i, fly){
   showChip(t);   // felia decupată cu relieful regiunii + steagul (layer suplimentar, zborul camerei rămâne)
   if (fly) flyTo(t); else { showPanel(); setArcK(1); }
 }
+/* ---------- Cadru final „de-a lungul rutei” pentru distanțe quasi-antipodale ----------
+   Pentru σ = distanța unghiulară Paris→țintă > 120° (Polinezia/Wallis/Caledonie),
+   orientarea finală a globului este aleasă astfel încât camera să privească planeta
+   DE-A LUNGUL cercului mare Paris→teritoriu, nu perpendicular pe el:
+     · axa vizuală (centru glob → cameră) = bisectoarea p̂/t̂, înclinată ε = 18° în
+       AFARA planului rutei — această înclinare „deschide” arcul pe disc (altfel,
+       cu axa exact în plan, arcul s-ar proiecta degenerat, pe o linie dreaptă);
+     · rostogolirea în jurul axei vizuale așază teritoriul JOS, ușor spre stânga
+       (vedeta cadrului), iar Paris SUS-dreapta — aproape de marginea opusă;
+     · ambele capete ajung la ~σ/2 de centrul discului; pentru ca amândouă să fie
+       pe emisfera vizibilă, camera se retrage (camZ ≈ 3.9–5.9) astfel încât limbul
+       globului (pentru r = 1.02, înălțimea markerelor) să acopere σ/2 + 5° margine.
+   Rotația completă (inclusiv ruloul z, nefolosit în modul normal) este construită
+   ca mapare de baze ortonormate: e1 = axa vizuală, e2 = direcția teritoriului ⊥ axă,
+   e3 = e1×e2 → bază-țintă în world (camDir, offset-teritoriu pe ecran, E1×E2).
+   Semnul lui ε se alege astfel încât apexul arcului să cadă în STÂNGA ecranului
+   (departe de panoul din dreapta). Determinist — aceeași țintă indiferent de
+   starea din care pornește zborul (spinul e înghețat în flyTo). */
+function routeFrame(t, sigma){
+  var pG = llToVec3(PARIS[0], PARIS[1], 1).applyAxisAngle(Y_AXIS, spinG.rotation.y).applyAxisAngle(Z_AXIS, tiltG.rotation.z).normalize();
+  var tG = llToVec3(t.coords[0], t.coords[1], 1).applyAxisAngle(Y_AXIS, spinG.rotation.y).applyAxisAngle(Z_AXIS, tiltG.rotation.z).normalize();
+  var mG = pG.clone().add(tG).normalize();                 // bisectoarea (direcția apexului)
+  var nG = pG.clone().cross(tG).normalize();               // normala planului rutei
+  var gx1 = isMobile ? 0 : -0.52, gy1 = isMobile ? 0.48 : 0.02;
+  /* distanța camerei: limbul sferei de rază 1.02 văzut de la distanța d acoperă
+     acos(1.02/d) din axa vizuală → cerința: ≥ σ/2 + 5° margine de siguranță */
+  var need = Math.min(sigma / 2 + 5 * Math.PI / 180, 1.45);
+  var d = Math.max(3.4, Math.min(6.2, 1.02 / Math.cos(need)));
+  var camZ = Math.sqrt(Math.max(1, d * d - gx1 * gx1 - (0.12 - gy1) * (0.12 - gy1)));
+  var camDir = new THREE.Vector3(-gx1, 0.12 - gy1, camZ).normalize();       // centru glob → cameră (world)
+  var xAx = new THREE.Vector3(0, 1, 0).cross(camDir).normalize();           // dreapta ecran (lookAt, up = +Y)
+  var yAx = camDir.clone().cross(xAx).normalize();                          // sus ecran
+  var chi = (isMobile ? 10 : 18) * Math.PI / 180;                           // teritoriul: jos + ușor stânga
+  var oT = yAx.clone().multiplyScalar(-Math.cos(chi)).add(xAx.clone().multiplyScalar(-Math.sin(chi))).normalize();
+  var E3 = new THREE.Vector3().crossVectors(camDir, oT);
+  var eps = 18 * Math.PI / 180;
+  function basis(sign){
+    var u = mG.clone().multiplyScalar(Math.cos(eps)).add(nG.clone().multiplyScalar(Math.sin(eps) * sign)).normalize();
+    var e2 = tG.clone().sub(u.clone().multiplyScalar(u.dot(tG))).normalize();
+    var e3 = new THREE.Vector3().crossVectors(u, e2);
+    return { u: u, e2: e2, e3: e3 };
+  }
+  var b = basis(1);
+  /* apexul (mG) se proiectează lateral ≈ (mG·e3)·E3 — vrem STÂNGA ecranului */
+  if (mG.dot(b.e3) * E3.dot(xAx) > 0) b = basis(-1);
+  var R = new THREE.Matrix4().makeBasis(camDir, oT, E3)
+        .multiply(new THREE.Matrix4().makeBasis(b.u, b.e2, b.e3).transpose());
+  var eu = new THREE.Euler().setFromRotationMatrix(R, globe.rotation.order);
+  return { x: eu.x, y: globe.rotation.y + shortestAngle(globe.rotation.y, eu.y), z: eu.z, camZ: camZ };
+}
+
 function flyTo(t){
   flying = true;   // îngheață spinul imediat → poziția markerului rămâne validă pe tot zborul
   var m = markers[selected];
-  // poziția markerului adusă în cadrul `globe` (compune spinul curent + înclinarea axei de 23,44°),
-  // astfel țintirea camerei rămâne exactă deși planeta se rotește în jurul unei axe înclinate
-  var q = m.pos.clone().applyAxisAngle(Y_AXIS, spinG.rotation.y).applyAxisAngle(Z_AXIS, tiltG.rotation.z);
-  var r = q.length();
-  var az = Math.atan2(q.x, q.z);                       // azimutul markerului în cadrul globului
-  var el = Math.asin(Math.max(-1, Math.min(1, q.y / r)));
-  var camX1 = 0, camZ1 = 2.28, camY1 = 0.12;
+  var camZ1 = 2.28, camY1 = 0.12;
   var gx1 = isMobile ? 0 : -0.52, gy1 = isMobile ? 0.48 : 0.02;
-  // direcția finală cameră → centru glob: markerul trebuie să ajungă pe această axă
-  var dx = camX1 - gx1, dy = camY1 - gy1, dz = camZ1;
-  var dl = Math.sqrt(dx*dx + dy*dy + dz*dz);
-  var Az = Math.atan2(dx / dl, dz / dl);               // azimutul punctului vizibil central
-  var El = Math.asin(dy / dl) + 0.05;                  // ușor deasupra centrului vizual
-  var targetY = globe.rotation.y + shortestAngle(globe.rotation.y, Az - az);
-  var targetX = el - El;                               // elevația finală = el - rotation.x
-  var startY = globe.rotation.y, startX = globe.rotation.x;
+  var sigma = llToVec3(PARIS[0], PARIS[1], 1).angleTo(llToVec3(t.coords[0], t.coords[1], 1));
+  var targetX, targetY, targetZ = 0;
+  if (sigma > ROUTE_SIGMA){
+    /* mod rută quasi-antipodală: camera privește DE-A LUNGUL cercului mare —
+       rotație completă (x, y + rulou z) + retragere de cameră, toate deterministe */
+    var rf = routeFrame(t, sigma);
+    targetX = rf.x; targetY = rf.y; targetZ = rf.z; camZ1 = rf.camZ;
+  } else {
+    // poziția markerului adusă în cadrul `globe` (compune spinul curent + înclinarea axei de 23,44°),
+    // astfel țintirea camerei rămâne exactă deși planeta se rotește în jurul unei axe înclinate
+    var q = m.pos.clone().applyAxisAngle(Y_AXIS, spinG.rotation.y).applyAxisAngle(Z_AXIS, tiltG.rotation.z);
+    var r = q.length();
+    var az = Math.atan2(q.x, q.z);                       // azimutul markerului în cadrul globului
+    var el = Math.asin(Math.max(-1, Math.min(1, q.y / r)));
+    // direcția finală cameră → centru glob: markerul trebuie să ajungă pe această axă
+    var dx = 0 - gx1, dy = camY1 - gy1, dz = camZ1;
+    var dl = Math.sqrt(dx*dx + dy*dy + dz*dz);
+    var Az = Math.atan2(dx / dl, dz / dl);               // azimutul punctului vizibil central
+    var El = Math.asin(dy / dl) + 0.05;                  // ușor deasupra centrului vizual
+    targetY = globe.rotation.y + shortestAngle(globe.rotation.y, Az - az);
+    targetX = el - El;                                   // elevația finală = el - rotation.x
+  }
+  var startY = globe.rotation.y, startX = globe.rotation.x, startZ = globe.rotation.z;
   var camZ0 = camera.position.z, camY0 = camera.position.y;
   var gx0 = globe.position.x, gy0 = globe.position.y;
   addTween(1800, function(k){
     globe.rotation.y = startY + (targetY - startY) * k;
     globe.rotation.x = startX + (targetX - startX) * k;
+    globe.rotation.z = startZ + (targetZ - startZ) * k;   // ruloul: 0 în mod normal, calculat în modul rută
     camera.position.z = camZ0 + (camZ1 - camZ0) * k;
     camera.position.y = camY0 + (camY1 - camY0) * k;
     globe.position.x = gx0 + (gx1 - gx0) * k;
@@ -1853,11 +1892,12 @@ function deselect(){
   clearArc();
   hideChip();   // felia se micșorează și dispare + steagul se estompează
   flying = true;
-  var startY = globe.rotation.y, startX = globe.rotation.x;
+  var startY = globe.rotation.y, startX = globe.rotation.x, startZ = globe.rotation.z;
   var camZ0 = camera.position.z, camY0 = camera.position.y;
   var gx0 = globe.position.x, gy0 = globe.position.y;
   addTween(1400, function(k){
     globe.rotation.x = startX + (defaultTilt - startX) * k;
+    globe.rotation.z = startZ * (1 - k);   // ruloul modului rută revine liniar la 0
     camera.position.z = camZ0 + (3.1 - camZ0) * k;
     camera.position.y = camY0 + (0.25 - camY0) * k;
     globe.position.x = gx0 * (1 - k);
@@ -1931,7 +1971,7 @@ window.__atlas.chip = function(){
 };
 window.__atlas.arc = function(){
   if (!arcState) return null;
-  var out = { k: +arcState.k.toFixed(3), sprites: 0, label: null, holo: !!arcState.holo };
+  var out = { k: +arcState.k.toFixed(3), sprites: 0, label: null, holo: !!arcState.holo, route: !!arcState.route };
   arcGroup.children.forEach(function(o){ if (o.isSprite) out.sprites++; });
   if (arcState.label){
     var L = arcState.label;
@@ -1941,6 +1981,18 @@ window.__atlas.arc = function(){
                   anchor: L.anchor || null,
                   inGroup: arcGroup.children.indexOf(L.sprite) >= 0,
                   screen: { x: (v.x*0.5+0.5)*window.innerWidth, y: (-v.y*0.5+0.5)*window.innerHeight, z: v.z } };
+  }
+  if (arcState.pts){   // bbox-ul proiecției arcului (px) — validare „întregul arc în cadru”
+    var vv = new THREE.Vector3();
+    arcGroup.updateWorldMatrix(true, false);
+    var x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+    for (var pi = 0; pi < arcState.pts.length; pi++){
+      vv.copy(arcState.pts[pi]).applyMatrix4(arcGroup.matrixWorld).project(camera);
+      var sx = (vv.x*0.5+0.5)*window.innerWidth, sy = (-vv.y*0.5+0.5)*window.innerHeight;
+      if (sx < x0) x0 = sx; if (sx > x1) x1 = sx;
+      if (sy < y0) y0 = sy; if (sy > y1) y1 = sy;
+    }
+    out.bbox = { x0: Math.round(x0), y0: Math.round(y0), x1: Math.round(x1), y1: Math.round(y1) };
   }
   return out;
 };
